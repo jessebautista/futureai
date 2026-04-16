@@ -1,0 +1,20 @@
+# Dependencies
+node_modules/
+agent-service/node_modules/
+
+# Build output
+.svelte-kit/
+build/
+dist/
+agent-service/dist/
+
+# Environment files
+.env
+.env.local
+agent-service/.env
+
+# OS
+.DS_Store
+
+# Logs
+*.log

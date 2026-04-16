@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm view *)",
+      "Bash(npm pack *)",
+      "Read(//tmp/**)",
+      "Bash(tar -tzf anthropic-ai-claude-code-*.tgz)",
+      "Bash(grep -E \"\\\\.\\(d\\\\.ts|js\\)$\")",
+      "Bash(tar -xzf anthropic-ai-claude-code-2.1.110.tgz package/package.json)",
+      "Bash(python3 -m json.tool)",
+      "Bash(npm create *)",
+      "Bash(npx sv *)",
+      "Bash(npm install *)"
+    ]
+  }
+}

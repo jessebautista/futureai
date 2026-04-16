@@ -28,3 +28,9 @@ export async function addRepo(name: string, path: string, github_url?: string) {
   repos.update(r => [repo, ...r]);
   return repo;
 }
+
+export async function deleteRepo(id: string) {
+  const res = await fetch(`/api/repos/${id}`, { method: 'DELETE' });
+  if (!res.ok) throw new Error(await res.text());
+  repos.update(r => r.filter(repo => repo.id !== id));
+}

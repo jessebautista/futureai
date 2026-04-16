@@ -14,6 +14,7 @@ import {
   getRepo,
   listRepos,
   updateRepo,
+  deleteRepo,
   getGuardrails,
   getBehaviorRules,
 } from './db.js';
@@ -23,9 +24,13 @@ import {
   buildBehaviorRulesPrompt,
   runAgentPipeline,
 } from './agents.js';
-import { StreamMessage } from './types.js';
+import { StreamMessage, Repo, Task } from './types.js';
 
 const PORT = parseInt(process.env['PORT'] ?? '8000', 10);
+
+// In-memory fallback stores (used when Supabase is not configured)
+const localRepos = new Map<string, Repo>();
+const localTasks = new Map<string, Task>();
 
 const anthropic = new Anthropic({
   apiKey: process.env['ANTHROPIC_API_KEY'],
@@ -43,6 +48,7 @@ app.addHook('onSend', async (request, reply) => {
 // Handle preflight OPTIONS requests
 app.addHook('onRequest', async (request, reply) => {
   if (request.method === 'OPTIONS') {
+    reply.hijack();
     reply.raw.setHeader('Access-Control-Allow-Origin', '*');
     reply.raw.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
     reply.raw.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
@@ -63,9 +69,10 @@ app.post('/run-agent', async (request, reply) => {
     repo_path: string;
     session_id?: string;
     repo_id?: string;
+    task_id?: string;
   };
 
-  const { task, repo_path: repoPath, session_id: sessionId, repo_id: repoId } = body;
+  const { task, repo_path: repoPath, session_id: sessionId, repo_id: repoId, task_id: existingTaskId } = body;
 
   if (!task || !repoPath) {
     reply.code(400);
@@ -84,15 +91,33 @@ app.post('/run-agent', async (request, reply) => {
   const rulesSection = buildBehaviorRulesPrompt(behaviorRules);
   const systemSnapshot = [guardrailsPrefix, rulesSection].filter(Boolean).join('\n');
 
-  // Create task in DB
-  const dbTask = await createTask(repoId ?? '', task, sessionId, systemSnapshot);
-  const taskId = dbTask?.id ?? `local-${Date.now()}`;
+  // Use existing task if task_id provided, otherwise create a new one
+  const dbTask = existingTaskId ? null : await createTask(repoId ?? '', task, sessionId, systemSnapshot);
+  const taskId = existingTaskId ?? dbTask?.id ?? `local-${Date.now()}`;
 
   if (dbTask) {
     await updateTaskStatus(taskId, 'running');
+  } else if (!localTasks.has(taskId)) {
+    const localTask: Task = {
+      id: taskId,
+      repo_id: repoId ?? '',
+      repo_path: repoPath,
+      description: task,
+      status: 'running',
+      session_id: sessionId,
+      system_prompt_snapshot: systemSnapshot,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    };
+    localTasks.set(taskId, localTask);
+  } else {
+    // Update existing task to running
+    const existing = localTasks.get(taskId)!;
+    localTasks.set(taskId, { ...existing, status: 'running', updated_at: new Date().toISOString() });
   }
 
-  // Set up streaming response
+  // Hijack the response — Fastify will no longer touch this socket
+  reply.hijack();
   reply.raw.setHeader('Content-Type', 'application/x-ndjson');
   reply.raw.setHeader('Transfer-Encoding', 'chunked');
   reply.raw.setHeader('Access-Control-Allow-Origin', '*');
@@ -221,36 +246,38 @@ app.post('/connect-repo', async (request, reply) => {
       detected_stack: detectedStack,
       has_claude_md: hasCaudeMd,
     });
-
-    return {
-      id: repo.id,
-      name: repo.name,
-      detected_stack: detectedStack,
-      has_claude_md: hasCaudeMd,
-      path: repo.path,
-    };
+    const full: Repo = { ...repo, detected_stack: detectedStack, has_claude_md: hasCaudeMd };
+    localRepos.set(full.id, full);
+    return full;
   }
 
-  // No DB — return a local response
-  return {
+  // No DB — store in memory so subsequent GETs work
+  const local: Repo = {
     id: `local-${Date.now()}`,
     name,
+    path: repoPath,
+    github_url: githubUrl,
     detected_stack: detectedStack,
     has_claude_md: hasCaudeMd,
-    path: repoPath,
+    created_at: new Date().toISOString(),
   };
+  localRepos.set(local.id, local);
+  return local;
 });
 
 // GET /repos
 app.get('/repos', async () => {
-  const repos = await listRepos();
-  return repos;
+  const dbRepos = await listRepos();
+  if (dbRepos.length > 0) return dbRepos;
+  return Array.from(localRepos.values()).sort(
+    (a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime()
+  );
 });
 
 // GET /repos/:id
 app.get('/repos/:id', async (request, reply) => {
   const { id } = request.params as { id: string };
-  const repo = await getRepo(id);
+  const repo = (await getRepo(id)) ?? localRepos.get(id);
   if (!repo) {
     reply.code(404);
     return { error: 'Repo not found' };
@@ -258,23 +285,62 @@ app.get('/repos/:id', async (request, reply) => {
   return repo;
 });
 
+// POST /tasks/create — creates a pending task record without running the agent
+app.post('/tasks/create', async (request) => {
+  const body = request.body as { repo_id: string; repo_path: string; description: string };
+  const { repo_id, repo_path, description } = body;
+  const now = new Date().toISOString();
+  const taskId = `local-${Date.now()}`;
+  const task: Task = {
+    id: taskId,
+    repo_id,
+    repo_path,
+    description,
+    status: 'pending',
+    created_at: now,
+    updated_at: now,
+  };
+  localTasks.set(taskId, task);
+  return task;
+});
+
 // GET /tasks
 app.get('/tasks', async (request) => {
   const query = request.query as { repo_id?: string };
-  const tasks = await listTasks(query.repo_id);
-  return tasks;
+  const dbTasks = await listTasks(query.repo_id);
+  if (dbTasks.length > 0) return dbTasks;
+  const all = Array.from(localTasks.values()).sort(
+    (a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime()
+  );
+  return query.repo_id ? all.filter(t => t.repo_id === query.repo_id) : all;
 });
 
 // GET /tasks/:id
 app.get('/tasks/:id', async (request, reply) => {
   const { id } = request.params as { id: string };
-  const task = await getTask(id);
+  const task = (await getTask(id)) ?? localTasks.get(id);
   if (!task) {
     reply.code(404);
     return { error: 'Task not found' };
   }
+  // Attach repo_path if not already set
+  const repoPath = task.repo_path ?? localRepos.get(task.repo_id)?.path;
   const messages = await getTaskMessages(id);
-  return { ...task, messages };
+  return { ...task, repo_path: repoPath, messages };
+});
+
+// DELETE /repos/:id
+app.delete('/repos/:id', async (request, reply) => {
+  const { id } = request.params as { id: string };
+  const repo = (await getRepo(id)) ?? localRepos.get(id);
+  if (!repo) {
+    reply.code(404);
+    return { error: 'Repo not found' };
+  }
+  await deleteRepo(id);
+  localRepos.delete(id);
+  reply.code(204);
+  return '';
 });
 
 // DELETE /run-agent/:sessionId (abort stub)
